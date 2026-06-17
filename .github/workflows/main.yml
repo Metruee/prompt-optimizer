@@ -1,0 +1,172 @@
+name: Sync with Upstream Repository
+
+# ============================================================
+# ① 你需要修改的环境变量（仅 2 个）
+# ============================================================
+env:
+  TARGET_BRANCH: develop          # 改为你的默认分支（如 main）
+  DEFAULT_UPSTREAM: linshenkx/prompt-optimizer# 改为你的上游仓库（格式：owner/repo）
+
+on:
+  # ==========================================================
+  # ② 手动触发时，输入框默认值需要单独设置（不能引用 env）
+  # ==========================================================
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: '上游仓库地址（格式：owner/repo）'
+        required: true
+        default: linshenkx/prompt-optimizer    # ③ 这里手动改为与 DEFAULT_UPSTREAM 相同
+      upstream_branch:
+        description: '上游分支名称'
+        required: true
+        default: develop          # ④ 这里手动改为与 TARGET_BRANCH 相同
+
+  # 每6小时自动运行一次（可按需修改）
+  schedule:
+    - cron: '0 */6 * * *'
+
+  # 当本仓库有 push 时触发（分支名需与 TARGET_BRANCH 一致）
+  push:
+    branches: [ develop ]         # ⑤ 这里手动改为与 TARGET_BRANCH 相同
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    # 显式赋予写入权限（必须开启，否则 push 会 403）
+    permissions:
+      contents: write
+
+    steps:
+      # ==========================================================
+      # 步骤1：检出当前仓库（使用 v5 避免 Node.js 20 弃用）
+      # ==========================================================
+      - name: Checkout current repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ==========================================================
+      # 步骤2：解决 Git 安全目录问题
+      # ==========================================================
+      - name: Fix Git safe.directory
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      # ==========================================================
+      # 步骤3：配置 Git 用户信息
+      # ==========================================================
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      # ==========================================================
+      # 步骤4：添加上游远程源（使用环境变量）
+      # ==========================================================
+      - name: Add upstream remote
+        run: |
+          UPSTREAM_REPO="${{ github.event.inputs.upstream_repo || env.DEFAULT_UPSTREAM }}"
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
+          git fetch upstream
+
+      # ==========================================================
+      # 步骤5：检查是否有新变更
+      # ==========================================================
+      - name: Check if there are changes to sync
+        id: check_changes
+        run: |
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || env.TARGET_BRANCH }}"
+          if git diff --quiet HEAD upstream/$UPSTREAM_BRANCH; then
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "no_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ==========================================================
+      # 步骤6：检查本地是否有修改（增强健壮性）
+      # ==========================================================
+      - name: Check for local modifications
+        id: check_local_modifications
+        run: |
+          TARGET="${{ env.TARGET_BRANCH }}"
+          git fetch origin $TARGET || true
+          if git rev-parse --verify origin/$TARGET >/dev/null 2>&1; then
+            if git diff --quiet HEAD origin/$TARGET; then
+              echo "has_local_modifications=false" >> $GITHUB_OUTPUT
+            else
+              echo "has_local_modifications=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "has_local_modifications=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ==========================================================
+      # 步骤7：执行同步（合并 + 强制推送）
+      # ==========================================================
+      - name: Sync with upstream
+        if: steps.check_changes.outputs.no_changes == 'false'
+        run: |
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || env.TARGET_BRANCH }}"
+          TARGET="${{ env.TARGET_BRANCH }}"
+          
+          git checkout $TARGET
+          
+          # 备份工作流文件，防止被上游覆盖
+          if [ -d ".github/workflows" ]; then
+            cp -r .github/workflows .github/workflows.backup
+          fi
+          
+          git fetch upstream $UPSTREAM_BRANCH
+          
+          # 尝试合并，若冲突则强制使用上游版本
+          if ! git merge upstream/$UPSTREAM_BRANCH --no-edit; then
+            echo "检测到合并冲突，强制使用上游版本"
+            git checkout --theirs .
+            git add .
+            git commit -m "强制同步：解决合并冲突，使用上游版本"
+          fi
+          
+          # 恢复工作流文件
+          if [ -d ".github/workflows.backup" ]; then
+            rm -rf .github/workflows
+            mv .github/workflows.backup .github/workflows
+            git add .github/workflows/
+          fi
+          
+          # 强制推送
+          git push origin $TARGET --force
+
+      # ==========================================================
+      # 步骤8：成功摘要
+      # ==========================================================
+      - name: Create sync summary
+        if: steps.check_changes.outputs.no_changes == 'false'
+        run: |
+          UPSTREAM_REPO="${{ github.event.inputs.upstream_repo || env.DEFAULT_UPSTREAM }}"
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || env.TARGET_BRANCH }}"
+          echo "## 🔄 同步完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ 已成功同步上游仓库的更改" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ 注意：工作流文件(.github/workflows/)已排除同步" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_local_modifications.outputs.has_local_modifications }}" == "true" ]; then
+            echo "🔄 检测到本地修改，已强制以远程仓库为准同步" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "🔧 冲突处理：自动使用上游版本覆盖本地修改" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**同步时间:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "**上游仓库:** $UPSTREAM_REPO" >> $GITHUB_STEP_SUMMARY
+          echo "**上游分支:** $UPSTREAM_BRANCH" >> $GITHUB_STEP_SUMMARY
+
+      # ==========================================================
+      # 步骤9：无变更通知
+      # ==========================================================
+      - name: No changes notification
+        if: steps.check_changes.outputs.no_changes == 'true'
+        run: |
+          echo "## ℹ️ 无需同步" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ 当前仓库已是最新状态" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**检查时间:** $(date)" >> $GITHUB_STEP_SUMMARY
